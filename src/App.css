@@ -76,3 +76,38 @@ body { margin: 0; background: var(--bg); color: var(--text-main); font-family: '
 .feed-target { color: var(--neon-blue); font-weight: bold; }
 .loading-overlay { position: absolute; bottom: 10px; right: 10px; color: var(--neon-blue); font-size: 0.8rem; animation: pulse 1s infinite; }
 @keyframes pulse { 0% { opacity: 0.5; } 100% { opacity: 1; } }
+
+/* 상세 테이블 스타일 강화 */
+.digital-table th { position: sticky; top: 0; background: #111; z-index: 5; }
+
+/* 주소 전체 표시 및 복사 기능용 */
+.full-addr-box {
+    color: var(--neon-purple);
+    font-family: monospace;
+    font-size: 0.85rem;
+    cursor: pointer;
+    background: rgba(189, 0, 255, 0.1); /* 연한 보라 배경 */
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    transition: all 0.2s;
+}
+
+.full-addr-box:hover {
+    background: var(--neon-purple);
+    color: #fff;
+}
+
+.copy-hint {
+    font-size: 0.8rem;
+    opacity: 0.5;
+}
+
+.full-addr-box:hover .copy-hint {
+    opacity: 1;
+}
+
+/* 툴팁이나 알림이 없으므로 커서로 힌트 제공 */
+.digital-table td { vertical-align: middle; }

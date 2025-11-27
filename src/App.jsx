@@ -10,14 +10,15 @@ const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY
 const QUICKNODE_RPC = import.meta.env.VITE_QUICKNODE_RPC
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-const SECRET_CODE = "49498989"
+const SECRET_CODE = import.meta.env.VITE_QUICKNODE_RPC
 
 function App() {
-  // State
   const [wallets, setWallets] = useState([])
-  const [globalTxs, setGlobalTxs] = useState([]) // 오른쪽 패널용 (전체)
-  const [selectedWallet, setSelectedWallet] = useState(null) // 현재 선택된 지갑
-  const [localTxs, setLocalTxs] = useState([]) // 중앙 하단 패널용 (선택된 지갑 상세)
+  const [globalTxs, setGlobalTxs] = useState([])
+  const [selectedWallet, setSelectedWallet] = useState(null)
+  
+  // 로컬 트랜잭션 (테이블용) - 그래프 확장시 계속 쌓임
+  const [accumulatedTxs, setAccumulatedTxs] = useState([]) 
   
   const [newAddress, setNewAddress] = useState('')
   const [newLabel, setNewLabel] = useState('')
@@ -30,7 +31,9 @@ function App() {
   const mapRef = useRef(null)
   const fgRef = useRef()
 
-  // --- 1. Init & Resize ---
+  // 방문한 노드 추적 (중복 요청 방지용)
+  const visitedNodes = useRef(new Set())
+
   useEffect(() => {
     fetchWallets()
     const handleResize = () => {
@@ -46,7 +49,6 @@ function App() {
     return () => window.removeEventListener('resize', handleResize)
   }, [])
 
-  // --- 2. Global Polling (Right Sidebar) ---
   useEffect(() => {
     if (wallets.length > 0) {
       fetchGlobalTransactions()
@@ -55,7 +57,6 @@ function App() {
     }
   }, [wallets])
 
-  // --- 3. Handlers ---
   const fetchWallets = async () => {
     const { data } = await supabase.from('tracked_wallets').select('*').order('created_at', { ascending: false })
     if (data) setWallets(data)
@@ -65,13 +66,11 @@ function App() {
     const code = prompt("ENTER SECURITY CODE:")
     if (code !== SECRET_CODE) return alert("DENIED")
     if (!newAddress) return
-
     const { error } = await supabase.from('tracked_wallets').insert([{ address: newAddress, label: newLabel || 'Target' }])
     if (!error) { setNewAddress(''); setNewLabel(''); fetchWallets(); }
     else alert(error.message)
   }
 
-  // 전체 트랜잭션 조회 (가볍게 Signature만)
   const fetchGlobalTransactions = async () => {
     setLoading(true)
     let all = []
@@ -90,27 +89,34 @@ function App() {
     setLoading(false)
   }
 
-  // ★ 특정 지갑 클릭 시: 심층 분석 (Deep Analyze)
-  const handleWalletClick = async (wallet) => {
-    setSelectedWallet(wallet)
-    setDetailLoading(true)
-    setLocalTxs([]) // 초기화
+  // ★ 공통 탐색 로직 (초기화 vs 확장에 재사용)
+  // isExpand: true면 기존 그래프에 붙이기, false면 초기화
+  const exploreAddress = async (address, label, isExpand = false) => {
+    if (visitedNodes.current.has(address) && isExpand) {
+        alert("Already explored this node!")
+        return
+    }
     
-    // 그래프 초기화 (Center Node: Selected Wallet)
-    const nodes = [{ id: wallet.address, group: 'root', label: wallet.label, val: 30 }]
-    const links = []
-    const nodeSet = new Set([wallet.address])
+    setDetailLoading(true)
+    
+    // 그래프에 추가할 임시 저장소
+    const newNodes = []
+    const newLinks = []
+    const existingNodeIds = new Set(isExpand ? graphData.nodes.map(n => n.id) : [])
+
+    // 루트 노드가 없으면 추가
+    if (!existingNodeIds.has(address)) {
+        newNodes.push({ id: address, group: isExpand ? 'recipient' : 'root', label: label, val: 30 })
+        existingNodeIds.add(address)
+    }
 
     try {
-      // 1. 최근 TX 5개 조회
       const sigRes = await axios.post(QUICKNODE_RPC, {
         jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress",
-        params: [wallet.address, { limit: 5 }]
+        params: [address, { limit: 5 }] // 확장 시 5개씩만
       })
       const sigs = sigRes.data.result || []
 
-      // 2. 각 TX의 상세 정보 조회 (Recipient 찾기 위해 getTransaction 호출)
-      // 주의: API 호출량 증가함
       const detailPromises = sigs.map(async (tx) => {
         const txRes = await axios.post(QUICKNODE_RPC, {
             jsonrpc: "2.0", id: 1, method: "getTransaction",
@@ -118,65 +124,95 @@ function App() {
         })
         const txData = txRes.data.result
         
-        // 간단한 수신자 추정 로직 (Solana에서 2번째 AccountKey가 보통 수신자)
-        // 실제로는 더 복잡하지만 데모용으로 간단히 처리
         let recipient = "Unknown"
         if (txData && txData.transaction && txData.transaction.message) {
             const keys = txData.transaction.message.accountKeys
-            // keys가 객체배열인 경우(version 0)와 문자열배열인 경우(legacy) 처리
             const destKey = typeof keys[1] === 'string' ? keys[1] : (keys[1]?.pubkey || "System")
-            if (destKey && destKey !== wallet.address) recipient = destKey
+            
+            // 수신자가 나(탐색주체)와 다르면 수신자로 간주
+            if (destKey && destKey !== address && destKey !== "System") {
+                recipient = destKey
+            }
         }
-
-        return { ...tx, recipient, status: tx.err ? 'Fail' : 'Success' }
+        return { ...tx, recipient, status: tx.err ? 'Fail' : 'Success', sourceAddr: address }
       })
 
       const detailedTxs = await Promise.all(detailPromises)
-      setLocalTxs(detailedTxs)
 
-      // 3. 그래프 데이터 구성 (Wallet -> Tx -> Recipient)
+      // 그래프 데이터 빌드
       detailedTxs.forEach(tx => {
         // TX Node
-        if (!nodeSet.has(tx.signature)) {
-            nodes.push({ id: tx.signature, group: 'tx', val: 10 })
-            nodeSet.add(tx.signature)
-            links.push({ source: wallet.address, target: tx.signature })
+        if (!existingNodeIds.has(tx.signature)) {
+            newNodes.push({ id: tx.signature, group: 'tx', val: 5 })
+            existingNodeIds.add(tx.signature)
+            newLinks.push({ source: address, target: tx.signature })
         }
 
-        // Recipient Node (수신자)
+        // Recipient Node
         if (tx.recipient && tx.recipient !== "Unknown") {
-            if (!nodeSet.has(tx.recipient)) {
-                nodes.push({ id: tx.recipient, group: 'recipient', val: 15, label: 'Receiver' })
-                nodeSet.add(tx.recipient)
+            if (!existingNodeIds.has(tx.recipient)) {
+                newNodes.push({ id: tx.recipient, group: 'recipient', val: 20, label: 'Unknown' })
+                existingNodeIds.add(tx.recipient)
             }
-            // 링크 연결 (TX -> Recipient)
-            links.push({ source: tx.signature, target: tx.recipient })
+            newLinks.push({ source: tx.signature, target: tx.recipient })
         }
       })
 
-      setGraphData({ nodes, links })
+      // 상태 업데이트
+      if (isExpand) {
+          setGraphData(prev => ({
+              nodes: [...prev.nodes, ...newNodes],
+              links: [...prev.links, ...newLinks]
+          }))
+          setAccumulatedTxs(prev => [...detailedTxs, ...prev]) // 테이블에도 추가
+      } else {
+          setGraphData({ nodes: newNodes, links: newLinks })
+          setAccumulatedTxs(detailedTxs)
+          visitedNodes.current.clear() // 초기화시 방문기록 삭제
+      }
       
-      // 그래프 줌 리셋
-      if(fgRef.current) fgRef.current.d3Force('charge').strength(-200)
+      visitedNodes.current.add(address)
 
     } catch (e) {
-      console.error("Deep Scan Error:", e)
+      console.error("Explore Error:", e)
     } finally {
       setDetailLoading(false)
     }
   }
 
+  // 초기 클릭 (Reset & Start)
+  const handleWalletClick = (wallet) => {
+    setSelectedWallet(wallet)
+    exploreAddress(wallet.address, wallet.label, false)
+  }
+
+  // 노드 클릭 (Expand)
+  const handleNodeClick = (node) => {
+    if (node.group === 'recipient') {
+        // 수신자 노드를 클릭하면 거기서부터 다시 탐색 시작
+        if (window.confirm(`Expand analysis for ${node.id}?`)) {
+            exploreAddress(node.id, "Expanded", true)
+        }
+    } else if (node.group === 'root') {
+        copyToClipboard(node.id)
+    }
+  }
+
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text)
+    alert(`Copied: ${text}`)
+  }
+
   return (
     <div className="app-container">
-      {/* 1. LEFT SIDEBAR */}
       <aside className="sidebar">
-        <div className="brand">⚡ HAWK EYE</div>
+        <div className="brand">⚡ ALVINTRACER</div>
         <div className="add-box">
           <input className="input-dark" placeholder="Addr" value={newAddress} onChange={e=>setNewAddress(e.target.value)} />
           <input className="input-dark" placeholder="Name" value={newLabel} onChange={e=>setNewLabel(e.target.value)} />
           <button className="btn-neon" onClick={addWallet}>ADD TARGET</button>
         </div>
-        <div className="list-header">CLICK TO ANALYZE ({wallets.length})</div>
+        <div className="list-header">ROOT TARGETS ({wallets.length})</div>
         <div className="list-area">
           {wallets.map(w => (
             <div 
@@ -191,14 +227,11 @@ function App() {
         </div>
       </aside>
 
-      {/* 2. CENTER PANEL (Split View) */}
       <div className="center-panel">
-        
-        {/* Top: Graph Map */}
         <div className="map-section" ref={mapRef}>
             <div className="section-title">
-                <span>FLOW GRAPH: {selectedWallet ? selectedWallet.label : "SELECT A TARGET"}</span>
-                {detailLoading && <span style={{color:'var(--neon-blue)'}}>ANALYZING DEEP DATA...</span>}
+                <span>INVESTIGATION GRAPH</span>
+                {detailLoading && <span style={{color:'var(--neon-blue)'}}> EXPANDING NETWORK...</span>}
             </div>
             <ForceGraph2D
                 ref={fgRef}
@@ -206,11 +239,14 @@ function App() {
                 height={dimensions.height}
                 graphData={graphData}
                 backgroundColor="#000"
-                nodeLabel="id"
+                nodeLabel={node => node.id} 
+                // 노드 클릭 이벤트 연결
+                onNodeClick={handleNodeClick}
+                
                 nodeColor={node => {
-                    if(node.group === 'root') return '#00b8ff' // Blue (Target)
-                    if(node.group === 'recipient') return '#bd00ff' // Purple (Recipient)
-                    return '#00ff9d' // Green (Tx)
+                    if(node.group === 'root') return '#00b8ff'
+                    if(node.group === 'recipient') return '#bd00ff'
+                    return '#00ff9d'
                 }}
                 nodeCanvasObject={(node, ctx, globalScale) => {
                     const fontSize = 12/globalScale
@@ -218,67 +254,62 @@ function App() {
                     
                     if (node.group === 'root') {
                         ctx.fillStyle = '#00b8ff'; ctx.fillRect(node.x-6, node.y-6, 12, 12)
-                        ctx.fillStyle='#fff'; ctx.fillText(node.label, node.x, node.y-10)
+                        ctx.fillStyle='#fff'; ctx.fillText(node.label || "Root", node.x, node.y-10)
                     } else if (node.group === 'recipient') {
-                        ctx.fillStyle = '#bd00ff'; ctx.beginPath(); ctx.arc(node.x, node.y, 5, 0, 2*Math.PI); ctx.fill();
-                        ctx.fillStyle='#bd00ff'; ctx.fillText(node.id.slice(0,4), node.x, node.y-8)
+                        // 클릭 유도를 위해 타겟 모양
+                        ctx.fillStyle = '#bd00ff'; ctx.beginPath(); ctx.arc(node.x, node.y, 6, 0, 2*Math.PI); ctx.fill();
+                        ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.5; ctx.stroke(); 
+                        ctx.fillStyle='#bd00ff'; ctx.fillText("Click to Expand", node.x, node.y-10)
                     } else {
                         ctx.fillStyle = '#00ff9d'; ctx.beginPath(); ctx.arc(node.x, node.y, 3, 0, 2*Math.PI); ctx.fill();
                     }
                 }}
-                linkColor={() => '#333'}
+                linkColor={() => '#444'}
                 linkDirectionalParticles={2}
-                linkDirectionalParticleSpeed={0.005}
             />
-            {!selectedWallet && <div style={{position:'absolute', top:'50%', left:'50%', transform:'translate(-50%,-50%)', color:'#444'}}>SELECT WALLET FROM LEFT</div>}
+            {!selectedWallet && <div style={{position:'absolute', top:'50%', left:'50%', transform:'translate(-50%,-50%)', color:'#444'}}>SELECT ROOT TARGET</div>}
         </div>
 
-        {/* Bottom: Detail List */}
         <div className="detail-section">
             <div className="section-title" style={{background:'#111'}}>
-                INTERCEPTED TRANSACTIONS & RECIPIENTS
+                ACCUMULATED TRACE LOGS
             </div>
             <div className="table-scroll">
                 <table className="digital-table">
                     <thead>
                         <tr>
-                            <th>Time</th>
-                            <th>TX Signature</th>
-                            <th>Recipient (Est.)</th>
-                            <th>Status</th>
+                            <th>From (Source)</th>
+                            <th>TX Hash</th>
+                            <th>To (Recipient)</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {localTxs.map(tx => (
-                            <tr key={tx.signature}>
-                                <td>{tx.blockTime ? formatDistanceToNow(new Date(tx.blockTime*1000)) : '-'}</td>
+                        {accumulatedTxs.map(tx => (
+                            <tr key={tx.signature + tx.sourceAddr}>
+                                <td style={{color:'#888'}}>{tx.sourceAddr.slice(0,6)}...</td>
                                 <td>
-                                    <a href={`https://solscan.io/tx/${tx.signature}`} target="_blank" className="addr-tag" style={{textDecoration:'none'}}>
-                                        {tx.signature.slice(0, 15)}...
+                                    <a href={`https://solscan.io/tx/${tx.signature}`} target="_blank" className="addr-tag">
+                                        {tx.signature.slice(0, 8)}...
                                     </a>
                                 </td>
                                 <td>
                                     {tx.recipient !== 'Unknown' ? (
-                                        <span className="addr-tag recipient-tag">{tx.recipient.slice(0, 15)}...</span>
-                                    ) : (
-                                        <span style={{color:'#444'}}>-</span>
-                                    )}
+                                        <div className="full-addr-box" onClick={() => copyToClipboard(tx.recipient)}>
+                                            {tx.recipient}
+                                            <span className="copy-hint">Click to Copy</span>
+                                        </div>
+                                    ) : '-'}
                                 </td>
-                                <td style={{color: tx.status==='Fail'?'red':'var(--neon-green)'}}>{tx.status}</td>
                             </tr>
                         ))}
-                        {localTxs.length === 0 && selectedWallet && 
-                            <tr><td colSpan="4" style={{textAlign:'center', padding:'20px'}}>No recent transactions or Loading...</td></tr>
-                        }
                     </tbody>
                 </table>
             </div>
         </div>
       </div>
 
-      {/* 3. RIGHT SIDEBAR (Global Feed) */}
       <aside className="feed-sidebar">
-        <div className="section-title">GLOBAL FEED (ALL TARGETS)</div>
+        <div className="section-title">GLOBAL MONITORING</div>
         <div className="feed-list">
             {globalTxs.map(tx => (
                 <div key={tx.signature} className="feed-item">
@@ -286,17 +317,14 @@ function App() {
                         <span className="feed-time">{tx.blockTime ? formatDistanceToNow(new Date(tx.blockTime*1000)) : 'now'}</span>
                         <span className={`feed-status ${tx.err?'fail':'success'}`}>{tx.err?'FAIL':'OK'}</span>
                     </div>
+                    <div className="feed-row"><span className="feed-target">{tx.wallet_label}</span></div>
                     <div className="feed-row">
-                        <span className="feed-target">{tx.wallet_label}</span>
-                    </div>
-                    <div className="feed-row">
-                        <a href={`https://solscan.io/tx/${tx.signature}`} target="_blank" style={{color:'#444', textDecoration:'none'}}>
-                            TX: {tx.signature.slice(0,12)}...
+                        <a href={`https://solscan.io/tx/${tx.signature}`} target="_blank" style={{color:'#666'}}>
+                            {tx.signature.slice(0,12)}...
                         </a>
                     </div>
                 </div>
             ))}
-            {loading && <div className="loading-overlay">Scanning...</div>}
         </div>
       </aside>
     </div>
