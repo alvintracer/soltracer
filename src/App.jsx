@@ -10,7 +10,7 @@ const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY
 const QUICKNODE_RPC = import.meta.env.VITE_QUICKNODE_RPC
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-const SECRET_CODE = import.meta.env.VITE_QUICKNODE_RPC
+const SECRET_CODE = import.meta.env.VITE_SECRET_CODE
 
 function App() {
   const [wallets, setWallets] = useState([])
